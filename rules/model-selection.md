@@ -6,12 +6,36 @@ GPT (Codex) and Gemini experts serve as specialized consultants for complex prob
 
 Before delegating, check which MCP tools are available in the current environment:
 
-1. **If both are available**: 
+1. **If both are available**:
    - Use **Gemini** for tasks requiring large context or multimodal analysis.
    - Use **GPT (Codex)** for tasks where the user explicitly asked for "GPT" or "Codex".
    - Default to **Gemini** for general reasoning.
 2. **If only one is available**: Use the available provider regardless of the task type.
 3. **If neither is available**: Do not delegate; inform the user that they need to run `/claude-delegator:setup`.
+
+## Model Auto-Selection
+
+Select the model tier based on the expert and task complexity. Do NOT always use the default — match the model to the workload.
+
+### Gemini
+
+| Expert / Task | Model | Rationale |
+|---------------|-------|-----------|
+| Security Analyst | `gemini-2.5-pro` | Needs deep reasoning across multiple files, OWASP coverage |
+| Architect (system design) | `gemini-2.5-pro` | Complex tradeoff analysis, multi-system reasoning |
+| Plan Reviewer | `gemini-2.5-pro` | Must evaluate completeness across dimensions |
+| Code Reviewer (large diff) | `gemini-2.5-pro` | Multi-file review needs broad context |
+| Code Reviewer (small diff) | `gemini-2.5-flash` | Simple reviews don't need pro capacity |
+| Scope Analyst | `gemini-2.5-flash` | Classification and question generation is fast |
+| Any quick advisory | `gemini-2.5-flash` | Short prompts, simple questions |
+
+### Codex (GPT)
+
+| Expert / Task | Model | Rationale |
+|---------------|-------|-----------|
+| All experts (default) | `gpt-5.3-codex` | Codex-optimized model for agentic tasks |
+
+**Rule of thumb**: If the prompt is >1KB or involves multiple files, use the `pro` tier.
 
 ## Expert Directory
 
