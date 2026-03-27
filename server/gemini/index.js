@@ -297,9 +297,12 @@ const handlers = {
       }
     } catch (e) {
       if (shouldRespond) {
+        const msg = e.message || String(e);
+        const retryable = msg.includes("timed out") || msg.includes("aborted") || msg.includes("ECONNRESET");
         sendResponse(id, {
-          content: [{ type: "text", text: `Error: ${e.message}` }],
-          isError: true
+          content: [{ type: "text", text: `Error: ${msg}${retryable ? "\n\n[RETRYABLE] This error is transient — retry with a shorter prompt, faster model, or failover to the other provider." : ""}` }],
+          isError: true,
+          retryable
         });
       }
     }
