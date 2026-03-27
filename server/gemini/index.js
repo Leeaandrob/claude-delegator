@@ -10,6 +10,7 @@
 const { spawn, execSync } = require("node:child_process");
 
 const DEFAULT_MODEL = "gemini-2.5-flash";
+const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
 const VALID_SANDBOX_VALUES = new Set(["read-only", "workspace-write"]);
 
 // --- MCP Protocol Helpers ---
@@ -42,24 +43,77 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+// --- JSON Parsing ---
+
+/**
+ * Extract the Gemini response JSON from CLI stdout.
+ * The -o json flag outputs a single JSON object, but terminal noise
+ * (keychain warnings, ANSI codes) can appear before/after it.
+ * Strategy: find JSON objects by scanning for balanced braces from the end.
+ */
+function parseGeminiOutput(raw) {
+  const trimmed = raw.trim();
+
+  // Fast path: entire output is valid JSON
+  try { return JSON.parse(trimmed); } catch (_) {}
+
+  // Find the last complete JSON object (most likely the response)
+  let depth = 0;
+  let end = -1;
+  let start = -1;
+
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    const ch = trimmed[i];
+    if (ch === '}') {
+      if (end === -1) end = i;
+      depth++;
+    } else if (ch === '{') {
+      depth--;
+      if (depth === 0) {
+        start = i;
+        break;
+      }
+    }
+  }
+
+  if (start === -1 || end === -1) {
+    throw new Error("No JSON object found in output");
+  }
+
+  return JSON.parse(trimmed.slice(start, end + 1));
+}
+
 // --- Gemini CLI Wrapper ---
 
-async function runGemini(args, cwd) {
+async function runGemini(args, cwd, timeoutMs) {
+  const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
+
   return new Promise((resolve, reject) => {
-    // Force JSON output for reliable parsing
     const geminiArgs = [...args, "-o", "json"];
     const geminiProcess = spawn("gemini", geminiArgs, {
       env: process.env,
       shell: false,
-      cwd: cwd || process.cwd() // Ensure we run in the requested directory
+      cwd: cwd || process.cwd()
     });
-    
+
     let stdout = "";
     let stderr = "";
+    let killed = false;
+
+    // Kill process on timeout to prevent indefinite hangs
+    const timer = setTimeout(() => {
+      killed = true;
+      geminiProcess.kill("SIGTERM");
+      // Force kill after 5s grace period
+      setTimeout(() => {
+        try { geminiProcess.kill("SIGKILL"); } catch (_) {}
+      }, 5_000);
+    }, timeout);
 
     geminiProcess.on("error", (err) => {
+      clearTimeout(timer);
       if (err.code === "ENOENT") {
-        reject(new Error("Gemini CLI not found. Please install it with 'npm install -g @google/gemini-cli'."));
+        reject(new Error("Gemini CLI not found. Install with: npm install -g @google/gemini-cli"));
       } else {
         reject(err);
       }
@@ -69,22 +123,35 @@ async function runGemini(args, cwd) {
     geminiProcess.stderr.on("data", (data) => { stderr += data.toString(); });
 
     geminiProcess.on("close", (code) => {
+      clearTimeout(timer);
+
+      if (killed) {
+        return reject(new Error(
+          `Gemini timed out after ${Math.round(timeout / 1000)}s. ` +
+          "Try a shorter prompt or a faster model (gemini-2.5-flash)."
+        ));
+      }
+
       if (code !== 0 && !stdout) {
-        return reject(new Error(stderr.trim() || `Gemini exited with code ${code}`));
+        const msg = stderr.trim() || `Gemini exited with code ${code}`;
+        // Surface actionable info from common failures
+        if (msg.includes("AbortError") || msg.includes("aborted")) {
+          return reject(new Error(
+            "Gemini API request was aborted (upstream timeout). " +
+            "Try a shorter prompt or check network connectivity."
+          ));
+        }
+        return reject(new Error(msg));
       }
 
       try {
-        // Extract JSON block (ignoring potential terminal noise)
-        const jsonMatch = stdout.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error("No JSON response found");
-        
-        const data = JSON.parse(jsonMatch[0]);
+        const data = parseGeminiOutput(stdout);
         resolve({
           response: data.response || "(No output)",
           threadId: data.session_id || "unknown"
         });
       } catch (e) {
-        reject(new Error(`Parse error: ${e.message}\nRaw output was: ${stdout}`));
+        reject(new Error(`Parse error: ${e.message}\nRaw stdout (last 500 chars): ${stdout.slice(-500)}`));
       }
     });
   });
@@ -116,7 +183,8 @@ const handlers = {
               "developer-instructions": { type: "string", description: "Expert system instructions" },
               sandbox: { type: "string", enum: ["read-only", "workspace-write"], default: "read-only" },
               cwd: { type: "string", description: "Current working directory" },
-              model: { type: "string", default: DEFAULT_MODEL }
+              model: { type: "string", default: DEFAULT_MODEL },
+              timeout: { type: "number", description: "Timeout in ms (default: 300000 = 5min)", default: DEFAULT_TIMEOUT_MS }
             },
             required: ["prompt"]
           }
@@ -130,7 +198,8 @@ const handlers = {
               threadId: { type: "string", description: "Session ID returned by a previous gemini call" },
               prompt: { type: "string", description: "Follow-up prompt" },
               sandbox: { type: "string", enum: ["read-only", "workspace-write"], default: "read-only" },
-              cwd: { type: "string" }
+              cwd: { type: "string" },
+              timeout: { type: "number", description: "Timeout in ms (default: 300000 = 5min)", default: DEFAULT_TIMEOUT_MS }
             },
             required: ["threadId", "prompt"]
           }
@@ -207,7 +276,8 @@ const handlers = {
         return;
       }
 
-      const { response, threadId } = await runGemini(geminiArgs, args.cwd);
+      const timeoutMs = (typeof args.timeout === "number" && args.timeout > 0) ? args.timeout : undefined;
+      const { response, threadId } = await runGemini(geminiArgs, args.cwd, timeoutMs);
       
       // Return metadata (threadId) at the top level for orchestration rules,
       // and standard content array for the UI.
