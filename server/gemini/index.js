@@ -43,68 +43,40 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-// --- JSON Parsing ---
-
-/**
- * Extract the Gemini response JSON from CLI stdout.
- * The -o json flag outputs a single JSON object, but terminal noise
- * (keychain warnings, ANSI codes) can appear before/after it.
- * Strategy: find JSON objects by scanning for balanced braces from the end.
- */
-function parseGeminiOutput(raw) {
-  const trimmed = raw.trim();
-
-  // Fast path: entire output is valid JSON
-  try { return JSON.parse(trimmed); } catch (_) {}
-
-  // Find the last complete JSON object (most likely the response)
-  let depth = 0;
-  let end = -1;
-  let start = -1;
-
-  for (let i = trimmed.length - 1; i >= 0; i--) {
-    const ch = trimmed[i];
-    if (ch === '}') {
-      if (end === -1) end = i;
-      depth++;
-    } else if (ch === '{') {
-      depth--;
-      if (depth === 0) {
-        start = i;
-        break;
-      }
-    }
-  }
-
-  if (start === -1 || end === -1) {
-    throw new Error("No JSON object found in output");
-  }
-
-  return JSON.parse(trimmed.slice(start, end + 1));
-}
-
 // --- Gemini CLI Wrapper ---
 
+/**
+ * Spawn Gemini CLI with stream-json output and parse NDJSON events.
+ *
+ * stream-json emits one JSON object per line:
+ *   {"type":"init",     "session_id":"...", "model":"..."}
+ *   {"type":"message",  "role":"user",      "content":"..."}
+ *   {"type":"message",  "role":"assistant",  "content":"...", "delta":true}  // streaming chunks
+ *   {"type":"result",   "status":"success",  "stats":{...}}
+ *
+ * This avoids buffering the entire response and gives us the session_id
+ * from the very first event.
+ */
 async function runGemini(args, cwd, timeoutMs) {
   const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
 
   return new Promise((resolve, reject) => {
-    const geminiArgs = [...args, "-o", "json"];
+    const geminiArgs = [...args, "-o", "stream-json"];
     const geminiProcess = spawn("gemini", geminiArgs, {
       env: process.env,
       shell: false,
       cwd: cwd || process.cwd()
     });
 
-    let stdout = "";
     let stderr = "";
     let killed = false;
+    let threadId = "unknown";
+    let responseChunks = [];
+    let lineBuf = "";
 
-    // Kill process on timeout to prevent indefinite hangs
     const timer = setTimeout(() => {
       killed = true;
       geminiProcess.kill("SIGTERM");
-      // Force kill after 5s grace period
       setTimeout(() => {
         try { geminiProcess.kill("SIGKILL"); } catch (_) {}
       }, 5_000);
@@ -119,22 +91,49 @@ async function runGemini(args, cwd, timeoutMs) {
       }
     });
 
-    geminiProcess.stdout.on("data", (data) => { stdout += data.toString(); });
+    // Parse NDJSON lines as they arrive
+    geminiProcess.stdout.on("data", (chunk) => {
+      lineBuf += chunk.toString();
+      const lines = lineBuf.split("\n");
+      lineBuf = lines.pop(); // keep incomplete line
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          if (event.type === "init" && event.session_id) {
+            threadId = event.session_id;
+          } else if (event.type === "message" && event.role === "assistant") {
+            responseChunks.push(event.content || "");
+          }
+        } catch (_) {
+          // ignore non-JSON lines (keychain warnings, etc.)
+        }
+      }
+    });
+
     geminiProcess.stderr.on("data", (data) => { stderr += data.toString(); });
 
     geminiProcess.on("close", (code) => {
       clearTimeout(timer);
 
       if (killed) {
+        // Return partial response if we got any chunks before timeout
+        const partial = responseChunks.join("");
+        if (partial) {
+          return resolve({
+            response: partial + "\n\n[Truncated: timed out after " + Math.round(timeout / 1000) + "s]",
+            threadId
+          });
+        }
         return reject(new Error(
           `Gemini timed out after ${Math.round(timeout / 1000)}s. ` +
           "Try a shorter prompt or a faster model (gemini-2.5-flash)."
         ));
       }
 
-      if (code !== 0 && !stdout) {
+      if (code !== 0 && responseChunks.length === 0) {
         const msg = stderr.trim() || `Gemini exited with code ${code}`;
-        // Surface actionable info from common failures
         if (msg.includes("AbortError") || msg.includes("aborted")) {
           return reject(new Error(
             "Gemini API request was aborted (upstream timeout). " +
@@ -144,15 +143,8 @@ async function runGemini(args, cwd, timeoutMs) {
         return reject(new Error(msg));
       }
 
-      try {
-        const data = parseGeminiOutput(stdout);
-        resolve({
-          response: data.response || "(No output)",
-          threadId: data.session_id || "unknown"
-        });
-      } catch (e) {
-        reject(new Error(`Parse error: ${e.message}\nRaw stdout (last 500 chars): ${stdout.slice(-500)}`));
-      }
+      const response = responseChunks.join("") || "(No output)";
+      resolve({ response, threadId });
     });
   });
 }
